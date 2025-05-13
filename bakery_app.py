@@ -8,8 +8,26 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QScrollArea, QFrame, QFileDialog, QDialog)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap, QIcon
+from PyQt6.QtPrintSupport import QPrinter, QPrintDialog
+from PyQt6.QtGui import QTextDocument
+
 import base64
 from contextlib import contextmanager
+
+
+import uuid
+from PyQt6.QtWidgets import QMessageBox
+
+AUTHORIZED_ID = "841b77f4b67b"  # Your authorized machine ID
+
+def get_machine_id():
+    return f"{uuid.getnode():012x}"
+
+def enforce_license():
+    if get_machine_id() != AUTHORIZED_ID:
+        QMessageBox.critical(None, "Unauthorized", "This copy is not licensed for this machine.")
+        sys.exit()
+
 
 class DatabaseManager:
     """Centralized database management"""
@@ -635,38 +653,49 @@ class BakeryApp(QMainWindow):
         if self.current_sale_table.rowCount() == 0:
             QMessageBox.warning(self, "Error", "No items in current sale")
             return
-        
+
         try:
+            invoice_number = self._get_next_invoice_number()
             with self.db.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("BEGIN TRANSACTION")
-                
+
                 for row in range(self.current_sale_table.rowCount()):
                     item_name = self.current_sale_table.item(row, 0).text()
                     quantity = int(self.current_sale_table.item(row, 1).text())
                     total_price = float(self.current_sale_table.item(row, 3).text().replace("$", ""))
-                    
+
                     cursor.execute('SELECT id FROM items WHERE name = ?', (item_name,))
                     item = cursor.fetchone()
-                    
+
                     if not item:
                         raise Exception(f"Item {item_name} not found")
-                    
-                    cursor.execute('INSERT INTO sales (item_id, quantity, total_price, sale_date) VALUES (?, ?, ?, ?)',
-                                 (item[0], quantity, total_price, datetime.now()))
-                
+
+                    cursor.execute('''
+                        INSERT INTO sales (item_id, quantity, total_price, sale_date)
+                        VALUES (?, ?, ?, ?)
+                    ''', (item[0], quantity, total_price, datetime.now()))
+
                 cursor.execute("COMMIT")
-                self._show_receipt()
-                self.current_sale_table.setRowCount(0)
-                self._update_total()
-                
+
+            self._show_receipt(invoice_number)
+            self.current_sale_table.setRowCount(0)
+            self._update_total()
+
         except Exception as e:
             QMessageBox.warning(self, "Error", str(e))
     
-    def _show_receipt(self):
-        receipt = "=== BAKERY RECEIPT ===\n\n"
+    def _show_receipt(self, invoice_number):
+        receipt = f"=== BAKERY RECEIPT ===\n\nInvoice #: INV-{invoice_number:04d}\n"
         receipt += f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        
+
+        html = f"""
+        <h2>Bakery Receipt</h2>
+        <p><strong>Invoice #:</strong> INV-{invoice_number:04d}<br>
+        <strong>Date:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        <hr><ul>
+        """
+
         total = 0
         for row in range(self.current_sale_table.rowCount()):
             item = self.current_sale_table.item(row, 0).text()
@@ -674,15 +703,53 @@ class BakeryApp(QMainWindow):
             price = self.current_sale_table.item(row, 2).text()
             total_item = self.current_sale_table.item(row, 3).text()
             total += float(total_item.replace("$", ""))
-            
-            receipt += f"{item}\n"
-            receipt += f"  {qty} x {price} = {total_item}\n"
-        
-        receipt += f"\nTotal: {self.total_label.text()}\n"
-        receipt += f"Total: LBP {int(total * 90000):,}\n"
-        receipt += "\nThank you for your purchase!"
-        
-        QMessageBox.information(self, "Receipt", receipt)
+
+            receipt += f"{item}\n  {qty} x {price} = {total_item}\n"
+            html += f"<li>{item} - {qty} x {price} = {total_item}</li>"
+
+        receipt += f"\nTotal: ${total:.2f}\nTotal: LBP {int(total * 90000):,}\nThank you for your purchase!"
+        html += f"</ul><hr><p><strong>Total:</strong> ${total:.2f}<br><strong>Total (LBP):</strong> {int(total * 90000):,}</p>"
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Receipt")
+        layout = QVBoxLayout(dialog)
+
+        label = QLabel()
+        label.setText(receipt.replace("\n", "<br>"))
+        label.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(label)
+
+        print_btn = QPushButton("Print Invoice")
+        print_btn.clicked.connect(lambda: self._print_html_invoice(html))
+        layout.addWidget(print_btn)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+
+        dialog.exec()
+    
+    def _show_report_dialog(self, title, html):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        layout = QVBoxLayout(dialog)
+
+        label = QLabel()
+        label.setTextFormat(Qt.TextFormat.RichText)
+        label.setText(html)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        print_btn = QPushButton("Print Report")
+        print_btn.clicked.connect(lambda: self._print_html_invoice(html))
+        layout.addWidget(print_btn)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+
+        dialog.exec()
+
     
     def _remove_from_sale(self, row):
         try:
@@ -871,7 +938,16 @@ class BakeryApp(QMainWindow):
             
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to load invoice history: {str(e)}")
-    
+
+    def _print_html_invoice(self, html):
+        document = QTextDocument()
+        document.setHtml(html)
+
+        printer = QPrinter()
+        dialog = QPrintDialog(printer, self)
+        if dialog.exec():
+            document.print(printer)
+
     def _show_invoice_details(self, sale_date):
         try:
             with self.db.get_connection() as conn:
@@ -891,23 +967,53 @@ class BakeryApp(QMainWindow):
             
             if not items:
                 return
-            
-            receipt = "=== INVOICE DETAILS ===\n\n"
-            receipt += f"Date: {datetime.strptime(items[0][0], '%Y-%m-%d %H:%M:%S.%f').strftime('%Y-%m-%d %H:%M')}\n\n"
-            
+
+            # Prepare invoice text
+            sale_time = datetime.strptime(items[0][0], '%Y-%m-%d %H:%M:%S.%f')
+            html = f"""
+            <h2>Invoice Details</h2>
+            <p><strong>Date:</strong> {sale_time.strftime('%Y-%m-%d %H:%M')}</p>
+            <hr>
+            <ul>
+            """
             total = 0
             for item in items:
-                receipt += f"{item[1]}\n"
-                receipt += f"  {item[2]} x ${item[3]/item[2]:.2f} = ${item[3]:.2f}\n"
+                qty = item[2]
+                unit_price = item[3] / qty
+                html += f"<li>{item[1]} - {qty} x ${unit_price:.2f} = ${item[3]:.2f}</li>"
                 total += item[3]
             
-            receipt += f"\nTotal: ${total:.2f}"
-            receipt += f"\nTotal: LBP {int(total * 90000):,}"
-            
-            QMessageBox.information(self, "Invoice Details", receipt)
-            
+            html += f"""
+            </ul>
+            <hr>
+            <p><strong>Total:</strong> ${total:.2f}</p>
+            <p><strong>Total (LBP):</strong> {int(total * 90000):,}</p>
+            """
+
+            # Show in a dialog with Print option
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Invoice Details")
+            layout = QVBoxLayout(dialog)
+
+            label = QLabel()
+            label.setTextFormat(Qt.TextFormat.RichText)
+            label.setText(html)
+            label.setWordWrap(True)
+            layout.addWidget(label)
+
+            print_btn = QPushButton("Print Invoice")
+            print_btn.clicked.connect(lambda: self._print_html_invoice(html))
+            layout.addWidget(print_btn)
+
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(dialog.accept)
+            layout.addWidget(close_btn)
+
+            dialog.exec()
+
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to show invoice details: {str(e)}")
+
     
     def _show_invoice_history(self):
         self._load_invoice_history()
@@ -1008,30 +1114,30 @@ class BakeryApp(QMainWindow):
                     GROUP BY i.name
                 ''', (today,))
                 sales = cursor.fetchall()
-            
+
             if not sales:
                 QMessageBox.information(self, "Daily Report", "No sales recorded for today")
                 return
-            
-            report = f"Daily Sales Report - {today}\n\n"
+
+            report_text = f"<h2>Daily Sales Report - {today}</h2><hr><ul>"
             total_sales = 0
-            
+
             for item in sales:
-                report += f"{item[0]}: {item[1]} units - ${item[2]:.2f}\n"
+                report_text += f"<li>{item[0]}: {item[1]} units - ${item[2]:.2f}</li>"
                 total_sales += item[2]
-            
-            report += f"\nTotal Sales: ${total_sales:.2f}"
-            report += f"\nTotal Sales: LBP {int(total_sales * 90000):,}"
-            
-            QMessageBox.information(self, "Daily Report", report)
-            
+
+            report_text += f"</ul><hr><p><strong>Total Sales:</strong> ${total_sales:.2f}<br>"
+            report_text += f"<strong>Total Sales (LBP):</strong> {int(total_sales * 90000):,}</p>"
+
+            self._show_report_dialog("Daily Report", report_text)
+
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to generate daily report: {str(e)}")
 
     def _generate_monthly_report(self):
         today = datetime.now()
         first_day = today.replace(day=1)
-        
+
         try:
             with self.db.get_connection() as conn:
                 cursor = conn.cursor()
@@ -1043,27 +1149,28 @@ class BakeryApp(QMainWindow):
                     GROUP BY i.name
                 ''', (first_day,))
                 sales = cursor.fetchall()
-            
+
             if not sales:
                 QMessageBox.information(self, "Monthly Report", "No sales recorded for this month")
                 return
-            
-            report = f"Monthly Sales Report - {today.strftime('%B %Y')}\n\n"
+
+            report_text = f"<h2>Monthly Sales Report - {today.strftime('%B %Y')}</h2><hr><ul>"
             total_sales = 0
-            
+
             for item in sales:
-                report += f"{item[0]}: {item[1]} units - ${item[2]:.2f}\n"
+                report_text += f"<li>{item[0]}: {item[1]} units - ${item[2]:.2f}</li>"
                 total_sales += item[2]
-            
-            report += f"\nTotal Sales: ${total_sales:.2f}"
-            report += f"\nTotal Sales: LBP {int(total_sales * 90000):,}"
-            
-            QMessageBox.information(self, "Monthly Report", report)
-            
+
+            report_text += f"</ul><hr><p><strong>Total Sales:</strong> ${total_sales:.2f}<br>"
+            report_text += f"<strong>Total Sales (LBP):</strong> {int(total_sales * 90000):,}</p>"
+
+            self._show_report_dialog("Monthly Report", report_text)
+
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to generate monthly report: {str(e)}")
 
 if __name__ == '__main__':
+    enforce_license() 
     app = QApplication(sys.argv)
     window = BakeryApp()
     window.show()
